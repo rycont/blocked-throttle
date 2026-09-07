@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 install -Dm755 blocked-throttle ~/.local/bin/blocked-throttle
 install -Dm644 blocked-throttle.service ~/.config/systemd/user/blocked-throttle.service
+[[ -e ~/.config/blocked-throttle.list ]] || install -Dm644 blocklist ~/.config/blocked-throttle.list
 
 sudo install -o root -g root -m 755 blocked-qos /usr/local/sbin/blocked-qos
 sed "s/^rycont /$USER /" blocked-qos.sudoers > /tmp/blocked-qos.sudoers.$$

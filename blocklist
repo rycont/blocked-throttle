@@ -1,0 +1,6 @@
+# 차단 도메인. 한 줄에 하나. 서브도메인은 자동으로 포함됩니다.
+# 수정하면 다음 창 전환 때 바로 반영됩니다 (재시작 불필요).
+x.com
+twitter.com
+instagram.com
+clien.net

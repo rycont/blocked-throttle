@@ -53,7 +53,18 @@ sudo /usr/local/sbin/blocked-qos on|off   # 수동으로 걸기/풀기
 | `WARN` | 300 | 경고 알림 |
 | `THRESHOLD` | 600 | 쿨다운 발동 |
 | `RELEASE` | 540 | 해제 (히스테리시스, 경계에서 깜빡이지 않게) |
-| `BLOCKED` | 정규식 | 차단 도메인 |
+
+차단 도메인은 `~/.config/blocked-throttle.list`:
+
+```
+# 한 줄에 하나. 서브도메인은 자동 포함.
+x.com
+twitter.com
+instagram.com
+clien.net
+```
+
+수정하면 **다음 창 전환 때 바로 반영**됩니다. 재시작 불필요. 목록이 비면 아무것도 잡지 않습니다.
 
 세기는 `blocked-qos` 상단 (`sudo -e /usr/local/sbin/blocked-qos`):
 

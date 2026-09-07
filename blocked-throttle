@@ -5,7 +5,16 @@ set -u
 LEDGER=~/.cache/blocked-throttle.ledger
 WINDOW=1200 WARN=300 THRESHOLD=600 RELEASE=540
 QOS=/usr/local/sbin/blocked-qos   # 네트워크 지연 (root 헬퍼, sudoers로 on/off만 허용)
-BLOCKED='^https?://([a-z0-9-]+\.)*(x\.com|twitter\.com|instagram\.com|clien\.net)(/|$)'
+LIST=~/.config/blocked-throttle.list   # 차단 도메인. 한 줄에 하나, # 주석 가능
+
+# 도메인 목록 -> 정규식. 목록이 비면 BLOCKED가 빈 값이 되어 아무것도 안 잡는다.
+load_blocklist() {
+  local doms
+  doms=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST" 2>/dev/null |
+         grep -v '^$' | sed 's/\./\\./g' | paste -sd'|')
+  [[ -z $doms ]] && { BLOCKED=""; return; }
+  BLOCKED="^https?://([a-z0-9-]+\.)*($doms)(/|\$)"
+}
 
 level_for() { # $1=차단초, $2=현재레벨 -> 0 정상 / 1 경고 / 2 쿨다운
   if   (( $1 >= THRESHOLD ));            then echo 2
@@ -14,7 +23,7 @@ level_for() { # $1=차단초, $2=현재레벨 -> 0 정상 / 1 경고 / 2 쿨다�
   else                                        echo 0; fi
 }
 
-match_blocked() { [[ $1 =~ $BLOCKED ]]; }
+match_blocked() { [[ -n ${BLOCKED:-} && $1 =~ $BLOCKED ]]; }
 
 current_url() {
   local f n
@@ -66,6 +75,8 @@ cooldown() { # $1 = on|off. 실패하면 조용히 다른 수단으로 갈아타
 }
 
 if [[ ${1:-} == --test ]]; then
+  LIST=$(mktemp); printf 'x.com\ntwitter.com\n# 주석\ninstagram.com\n\nclien.net\n' > "$LIST"
+  load_blocklist
   for u in https://x.com/home https://www.instagram.com/rycont/ https://www.clien.net/service/board/park \
            https://twitter.com/i/status/1 https://m.instagram.com; do
     match_blocked "$u" || { echo "FAIL miss: $u"; exit 1; }
@@ -74,6 +85,10 @@ if [[ ${1:-} == --test ]]; then
            https://notclien.net.evil.com/; do
     match_blocked "$u" && { echo "FAIL falsepos: $u"; exit 1; }
   done
+  # 빈 목록이면 아무것도 안 잡아야 한다
+  : > "$LIST"; load_blocklist
+  match_blocked https://x.com/home && { echo "FAIL 빈 목록인데 매칭됨"; exit 1; }
+  rm -f "$LIST"
   LEDGER=$(mktemp); now=$(date +%s)
   # 30분 전부터 차단, 25분 전에 해제 => 20분 창에 겹치는 건 없음
   printf '%s 1\n%s 0\n' $((now-1800)) $((now-1500)) > "$LEDGER"
@@ -99,6 +114,7 @@ if [[ ${1:-} == --test ]]; then
 fi
 
 if [[ ${1:-} == --status ]]; then
+  load_blocklist
   secs=$(blocked_secs)
   echo "url=$(current_url)  blocked=${secs}초/$WINDOW초  level=$(level_for "$secs" 0)"
   tc qdisc show | grep -q netem && echo "네트워크 지연: 적용 중" || echo "네트워크 지연: 없음"
@@ -140,6 +156,7 @@ while :; do
 
   # 이벤트가 없었으면 창/탭이 그대로라 URL도 그대로. 이벤트 때만 다시 읽는다.
   if (( rc == 0 )); then
+    load_blocklist   # 목록 수정이 재시작 없이 반영된다
     if [[ $class == app.zen_browser.zen ]] && match_blocked "$(current_url)"; then record 1; else record 0; fi
   fi
 
