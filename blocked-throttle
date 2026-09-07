@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Zen(flatpak)에서 차단 사이트를 최근 20분 중 10분 이상 보면 네트워크에 지연을 건다.
+# 상태 변화는 KWin 이벤트로 즉시, 임계 판정은 60초 틱으로.
+set -u
+LEDGER=~/.cache/blocked-throttle.ledger
+WINDOW=1200 WARN=300 THRESHOLD=600 RELEASE=540
+QOS=/usr/local/sbin/blocked-qos   # 네트워크 지연 (root 헬퍼, sudoers로 on/off만 허용)
+BLOCKED='^https?://([a-z0-9-]+\.)*(x\.com|twitter\.com|instagram\.com|clien\.net)(/|$)'
+
+level_for() { # $1=차단초, $2=현재레벨 -> 0 정상 / 1 경고 / 2 쿨다운
+  if   (( $1 >= THRESHOLD ));            then echo 2
+  elif (( $2 == 2 && $1 >= RELEASE ));   then echo 2   # 히스테리시스: 바로 안 풀림
+  elif (( $1 >= WARN ));                 then echo 1
+  else                                        echo 0; fi
+}
+
+match_blocked() { [[ $1 =~ $BLOCKED ]]; }
+
+current_url() {
+  local f n
+  f=$(ls -t ~/.var/app/app.zen_browser.zen/.zen/*/sessionstore-backups/recovery.jsonlz4 2>/dev/null | head -1)
+  [[ -z ${f:-} ]] && return
+  n=$(( $(stat -c%s "$f") - 12 ))
+  { printf '\x02\x21\x4c\x18'
+    printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((n&255)) $((n>>8&255)) $((n>>16&255)) $((n>>24&255)))"
+    tail -c +13 "$f"; } | lz4 -d -c 2>/dev/null |
+  jq -r '(.selectedWindow // 1) as $w | .windows[$w-1] | .tabs[.selected-1] | .entries[.index-1].url' 2>/dev/null
+}
+
+# 최근 WINDOW초 중 차단 상태였던 시간(초)
+blocked_secs() {
+  # 부팅 이전 기록은 아예 버린다: 꺼져 있던 시간이 사용 시간으로 잡히면 안 된다
+  awk -v now="$(date +%s)" -v win="$WINDOW" -v boot="$(awk '/^btime/{print $2}' /proc/stat)" '
+    $1 >= boot { n++; t[n]=$1; s[n]=$2 }
+    END {
+      lo = now - win; sum = 0
+      for (i = 1; i <= n; i++) {
+        if (!s[i]) continue
+        a = t[i]; b = (i < n ? t[i+1] : now)
+        if (a < lo) a = lo
+        if (b > now) b = now
+        if (b > a) sum += b - a
+      }
+      print int(sum)
+    }' "$LEDGER" 2>/dev/null || echo 0
+}
+
+record() { # $1 = 0|1, 상태가 바뀔 때만 기록
+  local last
+  last=$(tail -1 "$LEDGER" 2>/dev/null | awk '{print $2}')
+  [[ ${last:-x} == "$1" ]] && return
+  echo "$(date +%s) $1" >> "$LEDGER"
+  # ponytail: 통째로 다시 쓰는 프루닝. 하루 수백 줄이라 이걸로 충분.
+  tail -200 "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+}
+
+notify() { notify-send -a "집중" -u "$1" "$2" "$3"; }
+
+cooldown_active() { tc qdisc show 2>/dev/null | grep -q 'netem 30:'; }
+
+cooldown() { # $1 = on|off. 실패하면 조용히 다른 수단으로 갈아타지 않고 알린다.
+  if sudo -n "$QOS" "$1" >/dev/null 2>&1; then return 0; fi
+  logger -t blocked-throttle "QoS $1 실패 (헬퍼/sudoers 확인)"
+  notify critical "쿨다운 실패" "네트워크 제한을 $1 하지 못했습니다. sudo $QOS $1 을 확인하세요."
+  return 1
+}
+
+if [[ ${1:-} == --test ]]; then
+  for u in https://x.com/home https://www.instagram.com/rycont/ https://www.clien.net/service/board/park \
+           https://twitter.com/i/status/1 https://m.instagram.com; do
+    match_blocked "$u" || { echo "FAIL miss: $u"; exit 1; }
+  done
+  for u in https://xcode.com/ https://developer.mozilla.org/ https://news.ycombinator.com/x.com \
+           https://notclien.net.evil.com/; do
+    match_blocked "$u" && { echo "FAIL falsepos: $u"; exit 1; }
+  done
+  LEDGER=$(mktemp); now=$(date +%s)
+  # 30분 전부터 차단, 25분 전에 해제 => 20분 창에 겹치는 건 없음
+  printf '%s 1\n%s 0\n' $((now-1800)) $((now-1500)) > "$LEDGER"
+  [[ $(blocked_secs) == 0 ]] || { echo "FAIL 창 밖 구간이 새어들어옴: $(blocked_secs)"; exit 1; }
+  # 25분 전부터 지금까지 계속 차단 => 창 크기 전체(1200)로 잘려야 함
+  printf '%s 1\n' $((now-1500)) > "$LEDGER"
+  [[ $(blocked_secs) == 1200 ]] || { echo "FAIL 창 경계 클리핑: $(blocked_secs)"; exit 1; }
+  # 10분 전부터 5분 전까지만 차단 => 300초
+  printf '%s 1\n%s 0\n' $((now-600)) $((now-300)) > "$LEDGER"
+  [[ $(blocked_secs) == 300 ]] || { echo "FAIL 구간 합산: $(blocked_secs)"; exit 1; }
+  # 재부팅 시나리오: 부팅 이전 기록은 데몬이 늦게 떠도 세면 안 된다
+  btime=$(awk '/^btime/{print $2}' /proc/stat)
+  printf '%s 1\n' $((btime-3600)) > "$LEDGER"
+  [[ $(blocked_secs) == 0 ]] || { echo "FAIL 부팅 이전 기록이 셈에 들어감: $(blocked_secs)초"; exit 1; }
+  rm -f "$LEDGER"
+  # 레벨 사다리 + 히스테리시스
+  for c in "0 0 0" "299 0 0" "300 0 1" "599 1 1" "600 1 2" "599 2 2" "540 2 2" "539 2 1" "299 2 0" "0 1 0"; do
+    set -- $c
+    got=$(level_for "$1" "$2")
+    [[ $got == "$3" ]] || { echo "FAIL level_for($1,$2) = $got, 기대 $3"; exit 1; }
+  done
+  echo OK; exit 0
+fi
+
+if [[ ${1:-} == --status ]]; then
+  secs=$(blocked_secs)
+  echo "url=$(current_url)  blocked=${secs}초/$WINDOW초  level=$(level_for "$secs" 0)"
+  tc qdisc show | grep -q netem && echo "네트워크 지연: 적용 중" || echo "네트워크 지연: 없음"
+  exit 0
+fi
+
+# --- 데몬 ---
+# KWin 상주 스크립트: 활성 창이 바뀌거나(창 전환) 제목이 바뀔 때(탭 전환) 저널로 알린다.
+KWIN_JS=$(mktemp /tmp/blocked-throttle-XXXXXX.js)
+cat > "$KWIN_JS" <<'JS'
+let cur = null;
+const report = () => console.info("BTEVT|" + (workspace.activeWindow ? workspace.activeWindow.resourceClass : ""));
+workspace.windowActivated.connect(w => {
+  if (cur) { try { cur.captionChanged.disconnect(report); } catch (e) {} }
+  cur = w; if (w) w.captionChanged.connect(report); report();
+});
+JS
+trap 'rm -f "$KWIN_JS"' EXIT
+qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript bt >/dev/null 2>&1 || :
+id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$KWIN_JS" bt)
+qdbus6 org.kde.KWin /Scripting/Script$id org.kde.kwin.Script.run >/dev/null
+
+record 0            # 이전 인스턴스가 남긴 열린 구간을 닫는다 (첫 이벤트가 1초 안에 교정)
+
+# 재시작 시 level을 0으로 두면 이미 넘어선 임계를 새 전이로 착각해 알림이 다시 뜬다.
+# 실제 상태에서 복원한다: 지연이 걸려 있으면 2, 아니면 누적 시간으로 판정.
+if cooldown_active; then level=2; else level=$(level_for "$(blocked_secs)" 0); fi
+logger -t blocked-throttle "시작: level=$level, 누적=$(blocked_secs)초"
+class=""
+exec < <(journalctl -f -n0 -o cat _COMM=kwin_wayland 2>/dev/null | grep --line-buffered -a 'BTEVT|')
+
+while :; do
+  read -t 60 -r line; rc=$?
+  if (( rc == 0 )); then
+    class=${line#*BTEVT|}
+  elif (( rc <= 128 )); then
+    exit 0            # journalctl이 죽음 -> systemd가 재시작
+  fi
+
+  # 이벤트가 없었으면 창/탭이 그대로라 URL도 그대로. 이벤트 때만 다시 읽는다.
+  if (( rc == 0 )); then
+    if [[ $class == app.zen_browser.zen ]] && match_blocked "$(current_url)"; then record 1; else record 0; fi
+  fi
+
+  secs=$(blocked_secs)
+  new=$(level_for "$secs" "$level")
+
+  if (( new != level )); then
+    if (( level == 2 )); then     # 어떤 이유로든 2에서 빠져나오면 해제
+      cooldown off && notify normal "쿨다운 해제" "브라우저 속도를 되돌렸습니다."
+      logger -t blocked-throttle "cooldown OFF (${secs}s)"
+    fi
+    case "$new" in
+      1) (( level == 0 )) && notify normal "5분 넘게 봤습니다" "$((secs/60))분 경과. 10분 되면 브라우저가 느려집니다." ;;
+      2) cooldown on &&
+           notify critical "쿨다운" "20분 중 $((secs/60))분 사용. 네트워크에 600ms 지연을 걸었습니다."
+         logger -t blocked-throttle "cooldown ON (${secs}s)" ;;
+    esac
+    level=$new
+  fi
+done

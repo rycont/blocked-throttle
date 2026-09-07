@@ -1,0 +1,9 @@
+[Unit]
+Description=Throttle Zen on blocked-site usage
+PartOf=graphical-session.target
+[Service]
+ExecStart=%h/.local/bin/blocked-throttle
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=graphical-session.target
